@@ -149,6 +149,7 @@ NuPlayer::Renderer::Renderer(
       mSyncQueues(false),
       mPaused(false),
       mPauseDrainAudioAllowedUs(0),
+      mVideoPrerollInprogress(false),
       mVideoSampleReceived(false),
       mVideoRenderingStarted(false),
       mVideoRenderingStartGeneration(0),
@@ -378,8 +379,10 @@ void NuPlayer::Renderer::signalEnableOffloadAudio() {
     (new AMessage(kWhatEnableOffloadAudio, this))->post();
 }
 
-void NuPlayer::Renderer::pause() {
-    (new AMessage(kWhatPause, this))->post();
+void NuPlayer::Renderer::pause(bool forPreroll) {
+    sp<AMessage> msg = new AMessage(kWhatPause, this);
+    msg->setInt32("pause-for-preroll", forPreroll);
+    msg->post();
 }
 
 void NuPlayer::Renderer::resume() {
@@ -786,7 +789,9 @@ void NuPlayer::Renderer::onMessageReceived(const sp<AMessage> &msg) {
 
         case kWhatPause:
         {
-            onPause();
+            int32_t pauseForPreroll;
+            CHECK(msg->findInt32("pause-for-preroll", &pauseForPreroll));
+            onPause(pauseForPreroll);
             break;
         }
 
@@ -1335,7 +1340,7 @@ void NuPlayer::Renderer::onNewAudioMediaTime(int64_t mediaTimeUs) {
 void NuPlayer::Renderer::postDrainVideoQueue() {
     if (mDrainVideoQueuePending
             || getSyncQueues()
-            || (mPaused && mVideoSampleReceived)) {
+            || (mPaused && mVideoSampleReceived && !mVideoPrerollInprogress)) {
         return;
     }
 
@@ -1357,11 +1362,12 @@ void NuPlayer::Renderer::postDrainVideoQueue() {
 
     // notify preroll completed immediately when we are ready to post msg to drain video buf, so that
     // NuPlayer could wake up renderer early to resume AudioSink since audio sink resume has latency
-    if (mPaused && !mVideoSampleReceived) {
+    if (mVideoPrerollInprogress) {
         sp<AMessage> notify = mNotify->dup();
         notify->setInt32("what", kWhatVideoPrerollComplete);
         ALOGI("NOTE: notifying video preroll complete");
         notify->post();
+        mVideoPrerollInprogress = false;
     }
 
     int64_t nowUs = ALooper::GetNowUs();
@@ -1583,6 +1589,8 @@ void NuPlayer::Renderer::notifyEOS_l(bool audio, status_t finalResult, int64_t d
                 msg->post();
             }
         }
+    } else {
+        mHasVideo = false;
     }
 }
 
@@ -1751,6 +1759,7 @@ void NuPlayer::Renderer::onFlush(const sp<AMessage> &msg) {
         } else {
             notifyComplete = mNotifyCompleteVideo;
             mNotifyCompleteVideo = false;
+            mHasVideo = false;
         }
 
         // If we're currently syncing the queues, i.e. dropping audio while
@@ -1808,6 +1817,7 @@ void NuPlayer::Renderer::onFlush(const sp<AMessage> &msg) {
         flushQueue(&mVideoQueue);
 
         mDrainVideoQueuePending = false;
+        mVideoPrerollInprogress = false;
 
         if (mVideoScheduler != NULL) {
             mVideoScheduler->restart();
@@ -1898,9 +1908,17 @@ void NuPlayer::Renderer::onEnableOffloadAudio() {
     }
 }
 
-void NuPlayer::Renderer::onPause() {
+void NuPlayer::Renderer::onPause(bool forPreroll) {
     if (mPaused) {
         return;
+    }
+
+    if (forPreroll) {
+        if (mVideoSampleReceived) {
+            ALOGI("NOTE: already received video buffer, ignore preroll request");
+            return;
+        }
+        mVideoPrerollInprogress = true;
     }
 
     startAudioOffloadPauseTimeout();
@@ -2074,12 +2092,27 @@ status_t NuPlayer::Renderer::onOpenAudioSink(
     int32_t numChannels;
     CHECK(format->findInt32("channel-count", &numChannels));
 
-    int32_t rawChannelMask;
-    audio_channel_mask_t channelMask =
-            format->findInt32("channel-mask", &rawChannelMask) ?
-                    static_cast<audio_channel_mask_t>(rawChannelMask)
-                    // signal to the AudioSink to derive the mask from count.
-                    : CHANNEL_MASK_USE_CHANNEL_ORDER;
+    // channel mask info as read from the audio format
+    int32_t channelMaskFromFormat;
+    // channel mask to use for native playback
+    audio_channel_mask_t channelMask;
+    if (format->findInt32("channel-mask", &channelMaskFromFormat)) {
+        // KEY_CHANNEL_MASK follows the android.media.AudioFormat java mask
+        // which is left-bitshifted by 2 relative to the native mask
+        if ((channelMaskFromFormat & 0b11) != 0) {
+            // received an unexpected mask (supposed to follow AudioFormat constants
+            // for output masks with the 2 least-significant bits at 0), but
+            // it may come from an extractor that uses native masks: keeping
+            // the mask as given is ok as it contains at least mono or stereo
+            // and potentially the haptic channels
+            channelMask = static_cast<audio_channel_mask_t>(channelMaskFromFormat);
+        } else {
+            channelMask = static_cast<audio_channel_mask_t>(channelMaskFromFormat >> 2);
+        }
+    } else {
+        // no mask found: the mask will be derived from the channel count
+        channelMask = CHANNEL_MASK_USE_CHANNEL_ORDER;
+    }
 
     int32_t sampleRate;
     CHECK(format->findInt32("sample-rate", &sampleRate));
@@ -2304,12 +2337,8 @@ void NuPlayer::Renderer::onChangeAudioFormat(
     notify->post();
 }
 
-bool NuPlayer::Renderer::isVideoPrerollCompleted() const {
-    return mVideoSampleReceived || !mPaused;
-}
-
-bool NuPlayer::Renderer::isVideoSampleReceived() const {
-    return mVideoSampleReceived;
+bool NuPlayer::Renderer::isVideoPrerollInprogress() const {
+    return mVideoPrerollInprogress;
 }
 
 void NuPlayer::Renderer::setIsSeekonPause() {

@@ -786,6 +786,11 @@ protected:
                      */
                     bool            readAndClearHasChanged();
 
+                    /** Force updating track metadata to audio HAL stream next time
+                     * readAndClearHasChanged() is called.
+                     */
+                    void            setHasChanged() { mHasChanged = true; }
+
                 private:
                     void            logTrack(const char *funcName, const sp<T> &track) const;
 
@@ -2023,7 +2028,7 @@ class MmapThread : public ThreadBase
     virtual     void        threadLoop_exit();
     virtual     void        threadLoop_standby();
     virtual     bool        shouldStandby_l() { return false; }
-    virtual     status_t    exitStandby();
+    virtual     status_t    exitStandby_l() REQUIRES(mLock);
 
     virtual     status_t    initCheck() const { return (mHalStream == 0) ? NO_INIT : NO_ERROR; }
     virtual     size_t      frameCount() const { return mFrameCount; }
@@ -2066,6 +2071,26 @@ class MmapThread : public ThreadBase
 
     virtual     bool        isStreamInitialized() { return false; }
 
+                void        setClientSilencedState_l(audio_port_handle_t portId, bool silenced) {
+                                mClientSilencedStates[portId] = silenced;
+                            }
+
+                size_t      eraseClientSilencedState_l(audio_port_handle_t portId) {
+                                return mClientSilencedStates.erase(portId);
+                            }
+
+                bool        isClientSilenced_l(audio_port_handle_t portId) const {
+                                const auto it = mClientSilencedStates.find(portId);
+                                return it != mClientSilencedStates.end() ? it->second : false;
+                            }
+
+                void        setClientSilencedIfExists_l(audio_port_handle_t portId, bool silenced) {
+                                const auto it = mClientSilencedStates.find(portId);
+                                if (it != mClientSilencedStates.end()) {
+                                    it->second = silenced;
+                                }
+                            }
+
  protected:
                 void        dumpInternals_l(int fd, const Vector<String16>& args) override;
                 void        dumpTracks_l(int fd, const Vector<String16>& args) override;
@@ -2085,6 +2110,7 @@ class MmapThread : public ThreadBase
                 AudioHwDevice* const    mAudioHwDev;
                 ActiveTracks<MmapTrack> mActiveTracks;
                 float                   mHalVolFloat;
+                std::map<audio_port_handle_t, bool> mClientSilencedStates;
 
                 int32_t                 mNoCallbackWarningCount;
      static     constexpr int32_t       kMaxNoCallbackWarnings = 5;
@@ -2153,7 +2179,7 @@ public:
 
                 AudioStreamIn* clearInput();
 
-                status_t       exitStandby() override;
+                status_t       exitStandby_l() REQUIRES(mLock) override;
 
                 void           updateMetadata_l() override;
                 void           processVolume_l() override;
